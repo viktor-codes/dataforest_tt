@@ -1,17 +1,22 @@
 import requests
+import threading
 import queue
 import sqlite3
 import time
 import logging
 from logging.handlers import RotatingFileHandler
+import random
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 from dotenv import load_dotenv
 import os
+import multiprocessing
 
 # Load environment variables
 load_dotenv()
 BASE_URL = os.getenv("BASE_URL", "https://www.vendr.com")
-DB_FILE = os.getenv("DB_FILE", "products.db")
+DB_FILE = os.getenv("DB_FILE", "data/products.db")
 CATEGORIES = ["DevOps", "IT Infrastructure", "Data Analytics & Management"]
 
 # Configure Logging with RotatingFileHandler
@@ -179,3 +184,138 @@ def extract_price_data(product_url):
     )
 
     return {"price_range": price_range, "median_price": median_price}
+
+
+# Worker Thread for Scraping Products
+def product_worker():
+    while True:
+        product = product_queue.get()
+        if product is STOP_SIGNAL:
+            break
+
+        price_data = extract_price_data(product["url"])
+        product.update(price_data)
+        db_queue.put(product)
+
+        logging.info(f"Scraped: {product['name']}")
+        product_queue.task_done()
+        time.sleep(
+            random.uniform(0.1, 0.5)
+        )  # Adding random delay to avoid blocking
+
+
+# Database Worker
+def db_worker():
+    while True:
+        product = db_queue.get()
+        if product is STOP_SIGNAL:
+            break
+
+        save_to_db(product)
+        db_queue.task_done()
+
+
+# Save to Database
+def save_to_db(product):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO products
+            (name, category, description, price_range, median_price)
+            VALUES (?, ?, ?, ?, ?)
+        """,
+            (
+                product["name"],
+                product["category"],
+                product["description"],
+                product["price_range"],
+                product["median_price"],
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        logging.info(f"Product already exists: {product['name']}")
+    except Exception as e:
+        logging.error(f"Error saving product {product['name']}: {e}")
+    finally:
+        conn.close()
+
+
+# Main Function to Start Scraping
+def main():
+    start_time = time.time()  # Start timer
+
+    init_db()
+    categories = get_category_urls()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for category_name, category_url in categories:
+            category_content = fetch_page(category_url)
+            if not category_content:
+                continue
+
+            soup = BeautifulSoup(category_content, "lxml")
+            subcategory_divs = soup.find_all("div", class_="rt-Box rt-r-pb-1")
+
+            for div in subcategory_divs:
+                sub = div.find(
+                    "a",
+                    class_="rt-Text rt-reset rt-Link rt-r-size-2 "
+                           "rt-underline-always rt-high-contrast",
+                )
+                if sub:
+                    sub_name = sub.text.strip()
+                    sub_url = construct_full_url(sub["href"])
+                    futures.append(
+                        executor.submit(collect_products, sub_url, sub_name)
+                    )
+
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Scraping Subcategories",
+        ):
+            future.result()
+
+    # Start product scraping threads
+    num_threads = multiprocessing.cpu_count() * 2
+    threads = []
+    for _ in range(num_threads):
+        t = threading.Thread(target=product_worker)
+        t.start()
+        threads.append(t)
+
+    # Start database thread
+    db_thread = threading.Thread(target=db_worker)
+    db_thread.start()
+
+    product_queue.join()
+
+    for _ in range(num_threads):
+        product_queue.put(STOP_SIGNAL)
+    for t in threads:
+        t.join()
+
+    db_queue.join()
+    db_queue.put(STOP_SIGNAL)
+    db_thread.join()
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    logging.info(f"Scraping completed in {elapsed_time:.2f} seconds.")
+
+
+# Collect Products and Add to Queue
+def collect_products(subcategory_url, subcategory_name):
+    products = get_products_from_subcategory(subcategory_url, subcategory_name)
+    for product in tqdm(
+        products, desc=f"Queueing products from {subcategory_name}"
+    ):
+        product_queue.put(product)
+
+
+if __name__ == "__main__":
+    main()
