@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environment
+venv/
+env/
+*.venv
+
+# PyCharm
+.idea/
+*.iml
+workspace.xml
+
+# Logs and cache
+*.log
+*.cache
+*.pytest_cache/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Python package files
+*.egg-info/
+dist/
+build/
+
+# env files
+.env
