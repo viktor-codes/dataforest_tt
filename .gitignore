@@ -13,8 +13,7 @@ env/
 *.iml
 workspace.xml
 
-# Logs and cache
-*.log
+# Cache
 *.cache
 *.pytest_cache/
 
