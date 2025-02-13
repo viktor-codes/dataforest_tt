@@ -49,7 +49,7 @@ class ProcessManager:
         """Splits book links into chunks for each process."""
         chunk_size = math.ceil(len(self.book_links) / self.num_processes)
         return [
-            self.book_links[i * chunk_size : (i + 1) * chunk_size]
+            self.book_links[i * chunk_size: (i + 1) * chunk_size]
             for i in range(self.num_processes)
         ]
 
@@ -267,4 +267,3 @@ if __name__ == "__main__":
     logging.info(
         f"Scraping completed successfully in {total_time: .2f} seconds!"
     )
-
