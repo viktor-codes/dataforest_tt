@@ -1,11 +1,15 @@
+import asyncio
+import json
+import time
+import logging
+import math
+from dotenv import load_dotenv
+import os
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
-from tqdm import tqdm
-import logging
-import os
-from dotenv import load_dotenv
-from multiprocessing import set_start_method
+from multiprocessing import Process, set_start_method, Manager
 from logging.handlers import RotatingFileHandler
+from tqdm import tqdm
 
 # Required for macOS multiprocessing
 set_start_method("spawn", force=True)
@@ -26,6 +30,98 @@ logging.basicConfig(
         RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3),
     ],
 )
+
+# Stop signal for multiprocessing queues
+STOP_SIGNAL = "STOP"
+
+
+# Class to Manage Processes
+class ProcessManager:
+    def __init__(self, num_processes, book_links):
+        self.num_processes = num_processes
+        self.book_links = book_links
+        self.manager = Manager()
+        self.queue = self.manager.Queue()
+        self.processes = []
+        self.link_chunks = self._split_links()
+
+    def _split_links(self):
+        """Splits book links into chunks for each process."""
+        chunk_size = math.ceil(len(self.book_links) / self.num_processes)
+        return [
+            self.book_links[i * chunk_size : (i + 1) * chunk_size]
+            for i in range(self.num_processes)
+        ]
+
+    def start_processes(self):
+        """Starts the scraping processes."""
+        for i, chunk in enumerate(self.link_chunks):
+            process = Process(
+                target=scraper_worker, args=(chunk, self.queue, len(chunk))
+            )
+            self.processes.append(process)
+            process.start()
+            logging.info(f"Process {process.pid} started!")
+
+    def collect_data(self):
+        """Collects scraped data from all processes."""
+        all_data = []
+        stop_signals = 0
+
+        while stop_signals < self.num_processes:
+            result = self.queue.get()
+            if result == STOP_SIGNAL:
+                stop_signals += 1
+            else:
+                all_data.extend(result)
+
+        return all_data
+
+    def run(self):
+        """Starts, monitors, and collects scraping results."""
+        self.start_processes()
+
+        # Wait for all processes to complete
+        for process in self.processes:
+            process.join()
+
+        results = self.collect_data()
+
+        # Force terminate any hanging processes
+        for process in self.processes:
+            if process.is_alive():
+                process.terminate()
+                logging.warning(
+                    f"Process {process.pid} was forcibly terminated."
+                )
+
+        return results
+
+
+def scraper_worker(link_chunk, queue, total_links):
+    """Process worker function."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    results = loop.run_until_complete(scrape_books(link_chunk, total_links))
+    queue.put(results)
+    queue.put(STOP_SIGNAL)
+
+
+async def scrape_books(links, total_links):
+    """Scrapes multiple book pages using Playwright."""
+    data = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        with tqdm(
+            total=total_links, desc="📖 Scraping Books", unit="book"
+        ) as pbar:
+            for link in links:
+                book_data = await scrape_book(link, browser)
+                if book_data:
+                    data.append(book_data)
+                pbar.update(1)
+        await browser.close()
+    return data
 
 
 async def scrape_book(url, browser):
@@ -104,6 +200,9 @@ async def scrape_book(url, browser):
             product_info[key] = value
 
         await page.close()
+
+        logging.info(f"Scraped Book: {title}.")
+
         return {
             "title": title,
             "category": category,
@@ -148,3 +247,24 @@ async def get_all_book_links():
 
         await browser.close()
     return all_book_links
+
+
+# Main Execution
+if __name__ == "__main__":
+    logging.info("Collecting book links...")
+    start_time = time.perf_counter()
+    book_links = asyncio.run(get_all_book_links())
+
+    logging.info("Starting multiprocessing scraper...")
+    manager = ProcessManager(num_processes=3, book_links=book_links)
+    scraped_data = manager.run()
+
+    # Save to file
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(scraped_data, f, ensure_ascii=False, indent=4)
+
+    total_time = time.perf_counter() - start_time
+    logging.info(
+        f"Scraping completed successfully in {total_time: .2f} seconds!"
+    )
+
